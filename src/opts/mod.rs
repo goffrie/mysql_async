@@ -17,6 +17,7 @@ pub use rustls_opts::ClientIdentity;
 
 use percent_encoding::percent_decode;
 use rand::Rng;
+use tokio::sync::OnceCell;
 use url::{Host, Url};
 
 use std::{
@@ -528,7 +529,7 @@ pub(crate) struct MysqlOpts {
     stmt_cache_size: usize,
 
     /// Driver will require SSL connection if this option isn't `None` (default to `None`).
-    ssl_opts: Option<SslOpts>,
+    ssl_opts: Option<SslOptsAndCachedConnector>,
 
     /// Prefer socket connection (defaults to `true`).
     ///
@@ -869,7 +870,19 @@ impl Opts {
     ///
     ///
     pub fn ssl_opts(&self) -> Option<&SslOpts> {
-        self.inner.mysql_opts.ssl_opts.as_ref()
+        self.inner.mysql_opts.ssl_opts.as_ref().map(|o| &o.ssl_opts)
+    }
+
+    pub(crate) async fn build_tls_connector(&self) -> Result<Option<&crate::io::TlsConnector>> {
+        if let Some(o) = &self.inner.mysql_opts.ssl_opts {
+            let connector = o
+                .tls_connector
+                .get_or_try_init(move || o.ssl_opts.build_tls_connector())
+                .await?;
+            Ok(Some(connector))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Prefer socket connection (defaults to `true` **temporary `false` on Windows platform**).
@@ -1060,6 +1073,36 @@ impl Default for MysqlOpts {
         }
     }
 }
+
+#[derive(Clone)]
+struct SslOptsAndCachedConnector {
+    ssl_opts: SslOpts,
+    tls_connector: Arc<OnceCell<crate::io::TlsConnector>>,
+}
+
+impl fmt::Debug for SslOptsAndCachedConnector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SslOptsAndCachedConnector")
+            .field("ssl_opts", &self.ssl_opts)
+            .finish()
+    }
+}
+
+impl SslOptsAndCachedConnector {
+    fn new(ssl_opts: SslOpts) -> Self {
+        Self {
+            ssl_opts,
+            tls_connector: Arc::new(OnceCell::new()),
+        }
+    }
+}
+
+impl PartialEq for SslOptsAndCachedConnector {
+    fn eq(&self, other: &Self) -> bool {
+        self.ssl_opts == other.ssl_opts
+    }
+}
+impl Eq for SslOptsAndCachedConnector {}
 
 /// Connection pool constraints.
 ///
@@ -1258,7 +1301,7 @@ impl OptsBuilder {
 
     /// Defines SSL options. See [`Opts::ssl_opts`].
     pub fn ssl_opts<T: Into<Option<SslOpts>>>(mut self, ssl_opts: T) -> Self {
-        self.opts.ssl_opts = ssl_opts.into();
+        self.opts.ssl_opts = ssl_opts.into().map(SslOptsAndCachedConnector::new);
         self
     }
 
@@ -1538,6 +1581,7 @@ fn mysqlopts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
     let mut pool_min = DEFAULT_POOL_CONSTRAINTS.min;
     let mut pool_max = DEFAULT_POOL_CONSTRAINTS.max;
 
+    let mut ssl_opts = None;
     let mut skip_domain_validation = false;
     let mut accept_invalid_certs = false;
 
@@ -1763,7 +1807,9 @@ fn mysqlopts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
             }
         } else if key == "require_ssl" {
             match bool::from_str(&value) {
-                Ok(x) => opts.ssl_opts = x.then(SslOpts::default),
+                Ok(x) => {
+                    ssl_opts = x.then(SslOpts::default);
+                }
                 _ => {
                     return Err(UrlError::InvalidParamValue {
                         param: "require_ssl".into(),
@@ -1809,10 +1855,12 @@ fn mysqlopts_from_url(url: &Url) -> std::result::Result<MysqlOpts, UrlError> {
         });
     }
 
-    if let Some(ref mut ssl_opts) = opts.ssl_opts.as_mut() {
+    if let Some(ref mut ssl_opts) = ssl_opts {
         ssl_opts.accept_invalid_certs = accept_invalid_certs;
         ssl_opts.skip_domain_validation = skip_domain_validation;
     }
+
+    opts.ssl_opts = ssl_opts.map(SslOptsAndCachedConnector::new);
 
     Ok(opts)
 }
